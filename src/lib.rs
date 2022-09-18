@@ -1,8 +1,8 @@
 #![no_std]
 
 use embedded_hal as hal;
-use num_enum::{TryFromPrimitive};
-use core::{convert::TryFrom, slice::Windows};
+// use num_enum::{TryFromPrimitive};
+// use core::{convert::TryFrom, slice::Windows};
 mod firmware;
 
 pub struct BMA421<I2C, InterruptPin> {
@@ -40,9 +40,9 @@ impl<I2C, CommunicationError, InterruptPin> BMA421<I2C, InterruptPin>
 {
     /// verifies ability to talk to chip
     pub fn new<'a>(i2c: I2C,
-               address: I2C_Address,
-               interrupt_pin1: Option<InterruptPin>,
-               interrupt_pin2: Option<InterruptPin>,
+                   address: I2C_Address,
+                   interrupt_pin1: Option<InterruptPin>,
+                   interrupt_pin2: Option<InterruptPin>,
     ) -> Result<Self, Error<CommunicationError>>
     {
         let mut _self = Self{
@@ -60,19 +60,74 @@ impl<I2C, CommunicationError, InterruptPin> BMA421<I2C, InterruptPin>
         }
 
         // FIXME is this necessary upon init
-        let firmware = firmware::BLOB;
-        _self.load_firmware(&firmware)?;
+        // let firmware = firmware::BLOB;
+        // _self.load_firmware(&firmware, delay)?;
+
+        // FIXME is this necessary upon init
+        // TODO set interrupt mode
+
+        // FIXME is this necessary upon init
+        // TODO feature enable
+
+        // FIXME is this necessary upon init
+        // TODO step detector enable
+
+        // FIXME is this necessary upon init
+        // TODO accel enable
 
         Ok(_self)
     }
 
+    /// https://www.mouser.com/datasheet/2/783/BST-BMA423-DS000-1509600.pdf#%5B%7B%22num%22%3A245%2C%22gen%22%3A0%7D%2C%7B%22name%22%3A%22XYZ%22%7D%2C61%2C725%2C0%5D
+    pub fn enable_accelerometer(&mut self) -> Result<(), Error<CommunicationError>> {
+        let mut pwr_ctrl = self.read_register(Register::PWR_CTRL)?;
+        const ACC_EN_SHIFT:usize = 2;
+        pwr_ctrl |= 1 << ACC_EN_SHIFT;
+        self.write_register(Register::PWR_CTRL, pwr_ctrl)
+    }
+
+    /// blocks until accelerations available
+    /// note: enable_accelerometer() must be called beforehand
+    pub fn accelerations(&mut self) -> Result<[i16;3], Error<CommunicationError>> {
+        // make sure the data is available
+        while !(self.drdy()?) { /* wait for data */ }
+
+        // get the data
+        let mut buffer:[u8;6] = [0;6];
+        self.read_registers(Register::DATA_START, &mut buffer)?;
+
+        // convert the data
+        let mut accelerations:[i16;3] = [0; 3];
+        for i in 0..accelerations.len() {
+            let index = 2 * i;
+            let lsb = buffer[index] as i16;
+            let msb = buffer[index + 1] as i16;
+            let raw_value = (msb << 8) | lsb;
+            accelerations[i] = raw_value - (1<<11);
+        }
+        Ok(accelerations)
+    }
+
+    /// https://www.mouser.com/datasheet/2/783/BST-BMA423-DS000-1509600.pdf#%5B%7B%22num%22%3A245%2C%22gen%22%3A0%7D%2C%7B%22name%22%3A%22XYZ%22%7D%2C61%2C725%2C0%5D
+    pub fn disable_accelerometer(&mut self) -> Result<(), Error<CommunicationError>> {
+        let mut pwr_ctrl = self.read_register(Register::PWR_CTRL)?;
+        const ACC_EN_SHIFT:usize = 2;
+        pwr_ctrl &= !(1 << ACC_EN_SHIFT);
+        self.write_register(Register::PWR_CTRL, pwr_ctrl)
+    }
+
+
     /// load a binary firmware blob into the chip
-    pub fn load_firmware(&mut self, firmware: &[u8]) -> Result<bool, Error<CommunicationError>> {
+    pub fn load_firmware<DELAY>(&mut self, firmware: &[u8], delay: &mut DELAY) -> Result<bool, Error<CommunicationError>>
+        where
+            // TODO doesn't need real-time delay, could use threaded sleep()
+            DELAY: embedded_hal::blocking::delay::DelayMs<u16>,
+    {
         self.disable_adv_power_save()?;
 
-        // wait 450us for time synchronization
         // TODO should this be an activity of disable_adv_power_save?
-        // FIXME should wait
+        // wait 450us for time synchronization
+        delay.delay_ms(450);
 
         // disable initialization
         self.write_register(Register::INIT_CTRL, 0)?;
@@ -95,13 +150,14 @@ impl<I2C, CommunicationError, InterruptPin> BMA421<I2C, InterruptPin>
         } 
 
         // wait for 150us to initialize the ASIC
-        // FIXME should wait
+        delay.delay_ms(150);
 
         // confirm load
         let status = self.read_register(Register::MAGIC_2A)?;
         const ASIC_INITIALIZED_MASK:u8 = 0b1;
         Ok((status & ASIC_INITIALIZED_MASK) == ASIC_INITIALIZED_MASK)
     }
+
 
     /// https://www.mouser.com/datasheet/2/783/BST-BMA423-DS000-1509600.pdf#%5B%7B%22num%22%3A242%2C%22gen%22%3A0%7D%2C%7B%22name%22%3A%22XYZ%22%7D%2C61%2C442%2C0%5D
     pub fn disable_adv_power_save(&mut self) -> Result<(), Error<CommunicationError>> {
@@ -117,15 +173,7 @@ impl<I2C, CommunicationError, InterruptPin> BMA421<I2C, InterruptPin>
         self.write_register(Register::PWR_CONF, value)
     }
 
-
-
-
-
-// ARCHIVED code
-//--------------------------------------------------------------------------------
-
     /// put the chip into sleep
-    /// 
     pub fn sleep(&mut self) -> Result<(), Error<CommunicationError>> {
         self.write_register(Register::ACC_CONF, Mode::Normal as u8)
     }
@@ -146,39 +194,18 @@ impl<I2C, CommunicationError, InterruptPin> BMA421<I2C, InterruptPin>
     }
 
 
+    /// check if there is data
     fn drdy(&mut self) -> Result<bool, Error<CommunicationError>> {
         let status = self.read_register(Register::STATUS)?;
         const DRDY_MASK:u8 = 1 << 7;
         Ok((status & DRDY_MASK) == DRDY_MASK)
     }
 
-    pub fn accelerations(&mut self) -> Result<[i16;3], Error<CommunicationError>> {
-#[cfg(debug_assertions)]
-        // make sure the data is available
-        if !(self.drdy()?) {
-            return Err(Error::DataNotReady)
-        }
-
-        // get the data
-        let mut buffer:[u8;6] = [0;6];
-        self.read_registers(Register::DATA_START, &mut buffer)?;
-
-        // convert the data
-        let mut accelerations:[i16;3] = [0; 3];
-        for i in 0..accelerations.len() {
-            let index = 2 * i;
-            let lsb = buffer[index] as i16;
-            let msb = buffer[index + 1] as i16;
-            let raw_value = (msb << 8) | lsb;
-            accelerations[i] = raw_value - (1<<11);
-        }
-        Ok(accelerations)
-    }
-
+// helpers for I2C
+//--------------------------------------------------------------------------------
     fn read_register(&mut self, register: Register ) -> Result<u8, Error<CommunicationError>> {
-        let request = &[register as u8];
         let mut response:[u8;1] = [0;1];
-        self.i2c.write_read(self.address as u8, request, &mut response).map_err(Error::I2c)?;
+        self.read_registers(register, &mut response)?;
         Ok(response[0])
     }
 
