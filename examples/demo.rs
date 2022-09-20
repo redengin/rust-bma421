@@ -3,7 +3,7 @@
 use panic_rtt_target as _;
 use rtt_target::{rtt_init_print, rprintln};
 
-use rust_bma4::{BMA421, I2C_Address};
+use rust_bma4::{BMA421, I2C_Address, AccConf, AccOdr, AccBwp, AccPerfMode, AccRange};
 
 // hardware target (configure per your target)
 use cortex_m_rt::entry;
@@ -37,7 +37,9 @@ fn main() -> ! {
         interrupt_pin1,
         None,
     ).unwrap();
-    bma.enable_accelerometer().unwrap();
+    let acc_conf = AccConf{odr: AccOdr::odr_100, bandwidth: AccBwp::norm_avg4, perf_mode: AccPerfMode::cic_avg };
+    let acc_range = AccRange::range_2g;
+    bma.enable_accelerometer(acc_conf, acc_range).unwrap();
     // put the device into low power mode
     bma.low_power(None).unwrap();
 

@@ -59,38 +59,57 @@ impl<I2C, CommunicationError, InterruptPin> BMA421<I2C, InterruptPin>
             return Err(Error::UnknownChipId(chip_id))
         }
 
-        // FIXME is this necessary upon init
-        // let firmware = firmware::BLOB;
-        // _self.load_firmware(&firmware, delay)?;
-
-        // FIXME is this necessary upon init
-        // TODO set interrupt mode
-
-        // FIXME is this necessary upon init
-        // TODO feature enable
-
-        // FIXME is this necessary upon init
-        // TODO step detector enable
-
-        // FIXME is this necessary upon init
-        // TODO accel enable
+        // reset the chip to default state
+        _self.soft_reset()?;
 
         Ok(_self)
     }
 
+    /// https://www.mouser.com/datasheet/2/783/BST-BMA423-DS000-1509600.pdf#%5B%7B%22num%22%3A247%2C%22gen%22%3A0%7D%2C%7B%22name%22%3A%22XYZ%22%7D%2C61%2C725%2C0%5D
+    pub fn soft_reset(&mut self) -> Result<(), Error<CommunicationError>> {
+        const SOFT_RESET:u8 = 0xb6;
+        self.write_register(Register::CMD, SOFT_RESET)?;
+
+        loop {
+            let status = self.read_register(Register::INTERNAL_STATUS)?;
+            const MESSAGE_MASK:u8 = 0x1F;
+            const INIT_OK:u8 = 0x01;
+            match status & MESSAGE_MASK {
+                0x00    => {/* wait */},
+                INIT_OK => break,
+                _       => return Err(Error::InvalidChipStatus(status))
+            }
+        }
+        Ok(())
+    }
+
     /// https://www.mouser.com/datasheet/2/783/BST-BMA423-DS000-1509600.pdf#%5B%7B%22num%22%3A245%2C%22gen%22%3A0%7D%2C%7B%22name%22%3A%22XYZ%22%7D%2C61%2C725%2C0%5D
-    pub fn enable_accelerometer(&mut self) -> Result<(), Error<CommunicationError>> {
+    pub fn enable_accelerometer(&mut self, config: AccConf, range: AccRange) -> Result<(), Error<CommunicationError>> {
+
+        // power up the accelerometer
         let mut pwr_ctrl = self.read_register(Register::PWR_CTRL)?;
         const ACC_EN_SHIFT:usize = 2;
         pwr_ctrl |= 1 << ACC_EN_SHIFT;
-        self.write_register(Register::PWR_CTRL, pwr_ctrl)
+        self.write_register(Register::PWR_CTRL, pwr_ctrl)?;
+
+        // configure accelerometer
+        const BANDWIDTH_SHIFT:usize = 4;
+        const PERF_MODE_SHIFT:usize = 7;
+        let acc_conf = 
+              (config.odr as u8)
+            | ((config.bandwidth as u8) << BANDWIDTH_SHIFT)
+            | ((config.perf_mode as u8) << PERF_MODE_SHIFT);
+        self.write_register(Register::ACC_CONF, acc_conf)?;
+        self.write_register(Register::ACC_RANGE, range as u8)?;
+
+        Ok(())
     }
 
     /// blocks until accelerations available
     /// note: enable_accelerometer() must be called beforehand
     pub fn accelerations(&mut self) -> Result<[i16;3], Error<CommunicationError>> {
         // make sure the data is available
-        while !(self.drdy()?) { /* wait for data */ }
+        // while !(self.drdy()?) { /* wait for data */ }
 
         // get the data
         let mut buffer:[u8;6] = [0;6];
@@ -153,9 +172,14 @@ impl<I2C, CommunicationError, InterruptPin> BMA421<I2C, InterruptPin>
         delay.delay_ms(150);
 
         // confirm load
-        let status = self.read_register(Register::MAGIC_2A)?;
+        let status = self.read_register(Register::INTERNAL_STATUS)?;
         const ASIC_INITIALIZED_MASK:u8 = 0b1;
         Ok((status & ASIC_INITIALIZED_MASK) == ASIC_INITIALIZED_MASK)
+    }
+
+
+    pub fn set_interrupt_mode(&mut self, latched: bool) -> Result<(), Error<CommunicationError>> {
+        self.write_register(Register::INT_LATCH, match latched { true => 0b1, false => 0} )
     }
 
 
@@ -203,19 +227,19 @@ impl<I2C, CommunicationError, InterruptPin> BMA421<I2C, InterruptPin>
 
 // helpers for I2C
 //--------------------------------------------------------------------------------
-    fn read_register(&mut self, register: Register ) -> Result<u8, Error<CommunicationError>> {
+    fn read_register(&mut self, register: Register) -> Result<u8, Error<CommunicationError>> {
         let mut response:[u8;1] = [0;1];
         self.read_registers(register, &mut response)?;
         Ok(response[0])
     }
 
-    fn read_registers(&mut self, first_register: Register, response: &mut [u8] ) -> Result<(), Error<CommunicationError>> {
+    fn read_registers(&mut self, first_register: Register, response: &mut [u8]) -> Result<(), Error<CommunicationError>> {
         let request = &[first_register as u8];
         self.i2c.write_read(self.address as u8, request, response).map_err(Error::I2c)?;
         Ok(())
     }
 
-    fn write_register(&mut self, register: Register, value: u8 ) -> Result<(), Error<CommunicationError>> {
+    fn write_register(&mut self, register: Register, value: u8) -> Result<(), Error<CommunicationError>> {
         let request = &[register as u8, value];
         self.i2c.write(self.address as u8, request).map_err(Error::I2c)?;
         Ok(())
@@ -229,11 +253,72 @@ pub enum Error<CommunicationError> {
     I2c(CommunicationError),
     /// unrecognized BMA chip id
     UnknownChipId(u8),
+    /// invalid chip state
+    InvalidChipStatus(u8),
     /// Data not ready (likely chip is asleep)
     DataNotReady,
     /// Device failed to resume from reset
     ResetTimeout
 }
+
+/// https://www.mouser.com/datasheet/2/783/BST-BMA423-DS000-1509600.pdf#%5B%7B%22num%22%3A194%2C%22gen%22%3A0%7D%2C%7B%22name%22%3A%22XYZ%22%7D%2C61%2C725%2C0%5D
+pub struct AccConf {
+    pub odr:        AccOdr,
+    pub bandwidth:  AccBwp,
+    pub perf_mode:  AccPerfMode,
+}
+
+#[allow(non_camel_case_types)]
+#[repr(u8)]
+pub enum AccOdr {
+    odr_0p78    = 0x01,
+    odr_1p5     = 0x02,
+    odr_3p1     = 0x03,
+    odr_6p25    = 0x04,
+    odr_12p5    = 0x05,
+    odr_25      = 0x06,
+    odr_50      = 0x07,
+    odr_100     = 0x08,
+    odr_200     = 0x09,
+    odr_400     = 0x0a,
+    odr_800     = 0x0b,
+    odr_1k6     = 0x0c,
+    odr_3k2     = 0x0d,
+    odr_6k4     = 0x0e,
+    odr_12k8    = 0x0f,
+}
+#[allow(non_camel_case_types)]
+#[repr(u8)]
+pub enum AccBwp {
+    osr4_avg1   = 0x00,
+    osr2_avg2   = 0x01,
+    norm_avg4   = 0x02,
+    cic_avg8    = 0x03,
+    res_avg16   = 0x04,
+    res_avg32   = 0x05,
+    res_avg64   = 0x06,
+    res_avg128  = 0x07,
+}
+#[allow(non_camel_case_types)]
+#[repr(u8)]
+pub enum AccPerfMode {
+    cic_avg     = 0x00,
+    cont        = 0x01,
+}
+#[allow(non_camel_case_types)]
+#[repr(u8)]
+/// https://www.mouser.com/datasheet/2/783/BST-BMA423-DS000-1509600.pdf#%5B%7B%22num%22%3A198%2C%22gen%22%3A0%7D%2C%7B%22name%22%3A%22XYZ%22%7D%2C61%2C386%2C0%5D
+pub enum AccRange {
+    /// +/- 2g
+    range_2g    = 0x00,
+    /// +/- 4g
+    range_4g    = 0x01,
+    /// +/- 8g
+    range_8g    = 0x02,
+    /// +/- 16g
+    range_16g   = 0x03,
+}
+
 
 #[repr(u8)]
 /// https://www.bosch-sensortec.com/media/boschsensortec/downloads/datasheets/bst-bma400-ds000.pdf#page=40
@@ -270,7 +355,7 @@ enum Register {
     FIFO_LENGTH_START   = 0x24,
     FIFO_LENGTH_END     = 0x25,
     FIFO_DATA           = 0x26,
-    MAGIC_2A            = 0x2A,
+    INTERNAL_STATUS     = 0x2A,
     ACC_CONF            = 0x40,
     ACC_RANGE           = 0x41,
     AUX_CONF            = 0x44,
